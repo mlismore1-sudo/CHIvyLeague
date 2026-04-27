@@ -29,7 +29,6 @@ HOLDINGS_SIC_CODES = frozenset({
 })
 
 TARGET_SIC_CODES = sorted(TECH_SIC_CODES | HOLDINGS_SIC_CODES)
-TARGET_SIC_SET = TECH_SIC_CODES | HOLDINGS_SIC_CODES  # O(1) membership tests
 
 EXCLUDED_DIRECTOR_COUNTRIES = frozenset({
     "PAKISTAN", "TURKEY", "CHINA", "NIGERIA",
@@ -48,21 +47,23 @@ DB_PATH = DATA_DIR / "companies_cache.db"
 APP_USER_AGENT = "streamlit-companies-house-today-app"
 REQUEST_TIMEOUT = 30
 ADVANCED_SEARCH_PAGE_SIZE = 1000
-MAX_WORKERS = 10          # raised — I/O-bound; tune to key count × 3–4
+MAX_WORKERS = 10
 RATE_WINDOW_SECONDS = 300
 SAFE_REQUESTS_PER_WINDOW = 540
 
-# Pre-compute auth headers once per key rather than on every request
+# Pre-compute auth headers once per key — encoding is pure CPU waste if repeated
 _AUTH_HEADER_CACHE: Dict[str, Dict[str, str]] = {}
 _AUTH_CACHE_LOCK = threading.Lock()
 
-# ── Per-key rate limiter using a deque (O(1) append/popleft) ─────────────────
+# Per-key rate limiter using deque (O(1) append/popleft)
 _rate_buckets: Dict[str, deque] = {}
 _rate_lock = threading.Lock()
 
+_write_lock = threading.Lock()
+
 
 def _get_auth_header(api_key: str) -> Dict[str, str]:
-    """Cache Base64-encoded auth headers — encoding is pure CPU waste if repeated."""
+    """Cache Base64-encoded auth headers — encoding runs once per key, ever."""
     with _AUTH_CACHE_LOCK:
         if api_key not in _AUTH_HEADER_CACHE:
             token = base64.b64encode(f"{api_key}:".encode()).decode()
@@ -91,7 +92,7 @@ def get_api_keys() -> List[str]:
         if value:
             keys.append(str(value).strip())
     seen: set = set()
-    return [k for k in keys if k and not (k in seen or seen.add(k))]  # one-pass dedup
+    return [k for k in keys if k and not (k in seen or seen.add(k))]
 
 
 def classify_sector(sic_codes: List[str]) -> Optional[str]:
@@ -119,7 +120,6 @@ def get_http_session() -> requests.Session:
         allowed_methods=["GET"],
         raise_on_status=False,
     )
-    # Pool size matches MAX_WORKERS so no connection is ever queued waiting
     adapter = HTTPAdapter(
         max_retries=retry_strategy,
         pool_connections=MAX_WORKERS,
@@ -136,12 +136,11 @@ def get_http_session() -> requests.Session:
 @st.cache_resource
 def get_db_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    # WAL mode + aggressive memory use — reads never block writes
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA temp_store=MEMORY;")
-    conn.execute("PRAGMA cache_size=-32768;")   # 32 MB page cache (was default 2 MB)
-    conn.execute("PRAGMA mmap_size=268435456;") # 256 MB memory-mapped I/O
+    conn.execute("PRAGMA cache_size=-32768;")
+    conn.execute("PRAGMA mmap_size=268435456;")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS director_country_cache (
             company_number TEXT PRIMARY KEY,
@@ -176,12 +175,12 @@ def get_db_connection() -> sqlite3.Connection:
 def throttle_for_key(api_key: str) -> None:
     """Sliding-window rate limiter using collections.deque for O(1) operations."""
     while True:
-        now_ts = time.monotonic()  # monotonic avoids DST/NTP jumps
+        now_ts = time.monotonic()
         with _rate_lock:
             bucket = _rate_buckets.setdefault(api_key, deque())
             cutoff = now_ts - RATE_WINDOW_SECONDS
             while bucket and bucket[0] < cutoff:
-                bucket.popleft()          # O(1) vs list.pop(0) which is O(n)
+                bucket.popleft()
             if len(bucket) < SAFE_REQUESTS_PER_WINDOW:
                 bucket.append(now_ts)
                 return
@@ -212,9 +211,6 @@ def fetch_with_rotation(
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
-_write_lock = threading.Lock()
-
-
 def get_cached_decisions_map(company_numbers: List[str]) -> Dict[str, bool]:
     if not company_numbers:
         return {}
@@ -227,30 +223,8 @@ def get_cached_decisions_map(company_numbers: List[str]) -> Dict[str, bool]:
     return {cn: bool(ex) for cn, ex in rows}
 
 
-def upsert_director_decision(company_number: str, excluded: bool, countries: List[str]) -> None:
-    conn = get_db_connection()
-    countries_str = ", ".join(sorted(set(countries)))
-    checked_at = now_uk_str()
-    with _write_lock:
-        conn.execute(
-            """
-            INSERT INTO director_country_cache (company_number, excluded, director_countries, checked_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(company_number) DO UPDATE SET
-                excluded = excluded,
-                director_countries = excluded.director_countries,
-                checked_at = excluded.checked_at
-            """,
-            (company_number, int(excluded), countries_str, checked_at),
-        )
-        conn.commit()
-
-
-# ── Batch DB write: single transaction for all uncached results ───────────────
-
 def batch_upsert_decisions(results: List[Tuple[str, bool, List[str]]]) -> None:
-    """Write all officer-check results in ONE transaction — drastically faster than
-    one commit per company when handling dozens of new companies."""
+    """Write all officer-check results in ONE transaction — far faster than N individual commits."""
     if not results:
         return
     conn = get_db_connection()
@@ -297,8 +271,7 @@ def check_company_exclusion(
     company_number: str,
     api_keys: List[str],
 ) -> Tuple[str, bool, List[str]]:
-    """Returns (company_number, excluded, countries) — does NOT write to DB.
-    Batch writing is handled by the caller for efficiency."""
+    """Returns (company_number, excluded, countries). Does NOT write to DB — caller batches."""
     session = get_http_session()
     try:
         countries = get_active_director_countries(session, company_number, api_keys)
@@ -376,7 +349,7 @@ def enrich_exclusions(
                 fresh_results.append(result)
                 cached_map[result[0]] = result[1]
 
-        # Single transaction for all new results — replaces N individual commits
+        # Single transaction for all new results
         batch_upsert_decisions(fresh_results)
 
     checked_via_api = len(uncached_numbers)
@@ -413,7 +386,7 @@ def identify_new_rows(current_df: pd.DataFrame, seen_df: pd.DataFrame) -> pd.Dat
         return current_df.copy()
     if seen_df.empty or "company_number" not in seen_df.columns:
         return current_df.copy()
-    seen_set = set(seen_df["company_number"].astype(str))   # O(1) lookup set
+    seen_set = set(seen_df["company_number"].astype(str))
     return current_df[~current_df["company_number"].isin(seen_set)].reset_index(drop=True)
 
 
@@ -423,17 +396,19 @@ def save_daily_state(run_date: str, current_df: pd.DataFrame) -> None:
     export_df["run_date"] = run_date
     export_df["time_added_to_table"] = export_df["time_added_to_table"].astype(str)
     with _write_lock:
-        # Combine both DELETEs + both INSERTs into one transaction
-        conn.execute("BEGIN")
-        conn.execute("DELETE FROM daily_company_snapshots WHERE run_date = ?", (run_date,))
-        conn.execute("DELETE FROM daily_seen_companies WHERE run_date = ?", (run_date,))
-        export_df[
-            ["run_date", "company_number", "company_name", "sector", "time_added_to_table", "pull_order"]
-        ].to_sql("daily_company_snapshots", conn, if_exists="append", index=False)
-        export_df[["run_date", "company_number"]].drop_duplicates().to_sql(
-            "daily_seen_companies", conn, if_exists="append", index=False
-        )
-        conn.execute("COMMIT")
+        try:
+            conn.execute("DELETE FROM daily_company_snapshots WHERE run_date = ?", (run_date,))
+            conn.execute("DELETE FROM daily_seen_companies WHERE run_date = ?", (run_date,))
+            export_df[
+                ["run_date", "company_number", "company_name", "sector", "time_added_to_table", "pull_order"]
+            ].to_sql("daily_company_snapshots", conn, if_exists="append", index=False)
+            export_df[["run_date", "company_number"]].drop_duplicates().to_sql(
+                "daily_seen_companies", conn, if_exists="append", index=False
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def get_cache_size() -> int:
@@ -538,8 +513,8 @@ def main() -> None:
         })
     else:
         current_df = load_snapshot(run_date)
-        st.session_state.setdefault("latest_df", current_df)
         empty_cols = current_df.columns if not current_df.empty else ["company_number", "company_name", "sector", "time_added_to_table", "pull_order"]
+        st.session_state.setdefault("latest_df", current_df)
         st.session_state.setdefault("new_df", pd.DataFrame(columns=empty_cols))
         st.session_state.setdefault("checked_this_run", 0)
         st.session_state.setdefault("cache_hits_this_run", 0)
@@ -586,9 +561,9 @@ def main() -> None:
 - `deque`-based sliding-window rate limiter: O(1) vs the original O(n) `list.pop(0)`.
 - `time.monotonic()` for rate-limiting timestamps — immune to clock changes.
 - `frozenset` for SIC code lookups — slightly faster membership than `set`.
-- Thread pool sized to `MAX_WORKERS` with matching HTTP connection pool — no queueing.
-- `save_daily_state` wraps all four DB operations in one explicit transaction.
-- `session_state.update({})` batches state writes in a single call.
+- Thread pool sized to `MAX_WORKERS=10` with matching HTTP connection pool — no thread queuing.
+- `save_daily_state` uses `conn.commit()` (not raw SQL `COMMIT`) with rollback on failure.
+- `session_state.update({})` batches all state writes in a single call.
         """)
 
 
