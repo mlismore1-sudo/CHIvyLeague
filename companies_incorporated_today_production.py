@@ -2,6 +2,7 @@ import base64
 import sqlite3
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -15,24 +16,24 @@ from urllib3.util.retry import Retry
 
 st.set_page_config(page_title="Companies Incorporated Today", layout="wide")
 
-TECH_SIC_CODES = {
+# ── Constants ────────────────────────────────────────────────────────────────
+
+TECH_SIC_CODES = frozenset({
     "62012", "62020", "58290", "58210", "61100", "61200", "61300", "61900",
     "62011", "62030", "62090", "63110", "63120", "71200", "72110", "72190",
     "72200", "71129",
-}
+})
 
-HOLDINGS_SIC_CODES = {
+HOLDINGS_SIC_CODES = frozenset({
     "64201", "64202", "64203", "64204", "64205", "64209", "66300",
-}
+})
 
 TARGET_SIC_CODES = sorted(TECH_SIC_CODES | HOLDINGS_SIC_CODES)
+TARGET_SIC_SET = TECH_SIC_CODES | HOLDINGS_SIC_CODES  # O(1) membership tests
 
-EXCLUDED_DIRECTOR_COUNTRIES = {
-    "PAKISTAN",
-    "TURKEY",
-    "CHINA",
-    "NIGERIA",
-}
+EXCLUDED_DIRECTOR_COUNTRIES = frozenset({
+    "PAKISTAN", "TURKEY", "CHINA", "NIGERIA",
+})
 
 COUNTRY_NORMALISATION = {
     "TURKIYE": "TURKEY",
@@ -47,14 +48,29 @@ DB_PATH = DATA_DIR / "companies_cache.db"
 APP_USER_AGENT = "streamlit-companies-house-today-app"
 REQUEST_TIMEOUT = 30
 ADVANCED_SEARCH_PAGE_SIZE = 1000
-MAX_WORKERS = 6
+MAX_WORKERS = 10          # raised — I/O-bound; tune to key count × 3–4
 RATE_WINDOW_SECONDS = 300
-RATE_LIMIT_PER_KEY = 600
 SAFE_REQUESTS_PER_WINDOW = 540
 
-request_budget_lock = threading.Lock()
-request_budget: Dict[str, List[float]] = {}
-write_lock = threading.Lock()
+# Pre-compute auth headers once per key rather than on every request
+_AUTH_HEADER_CACHE: Dict[str, Dict[str, str]] = {}
+_AUTH_CACHE_LOCK = threading.Lock()
+
+# ── Per-key rate limiter using a deque (O(1) append/popleft) ─────────────────
+_rate_buckets: Dict[str, deque] = {}
+_rate_lock = threading.Lock()
+
+
+def _get_auth_header(api_key: str) -> Dict[str, str]:
+    """Cache Base64-encoded auth headers — encoding is pure CPU waste if repeated."""
+    with _AUTH_CACHE_LOCK:
+        if api_key not in _AUTH_HEADER_CACHE:
+            token = base64.b64encode(f"{api_key}:".encode()).decode()
+            _AUTH_HEADER_CACHE[api_key] = {
+                "Authorization": f"Basic {token}",
+                "User-Agent": APP_USER_AGENT,
+            }
+        return _AUTH_HEADER_CACHE[api_key]
 
 
 def today_uk_str() -> str:
@@ -74,25 +90,12 @@ def get_api_keys() -> List[str]:
         value = st.secrets.get(key_name, "")
         if value:
             keys.append(str(value).strip())
-    deduped_keys = []
-    seen = set()
-    for key in keys:
-        if key and key not in seen:
-            deduped_keys.append(key)
-            seen.add(key)
-    return deduped_keys
-
-
-def auth_header(api_key: str) -> Dict[str, str]:
-    token = base64.b64encode(f"{api_key}:".encode()).decode()
-    return {
-        "Authorization": f"Basic {token}",
-        "User-Agent": APP_USER_AGENT,
-    }
+    seen: set = set()
+    return [k for k in keys if k and not (k in seen or seen.add(k))]  # one-pass dedup
 
 
 def classify_sector(sic_codes: List[str]) -> Optional[str]:
-    codes = {str(code) for code in (sic_codes or [])}
+    codes = set(sic_codes) if sic_codes else set()
     if codes & HOLDINGS_SIC_CODES:
         return "Holdings"
     if codes & TECH_SIC_CODES:
@@ -101,11 +104,11 @@ def classify_sector(sic_codes: List[str]) -> Optional[str]:
 
 
 def normalise_country(country: str) -> str:
-    value = str(country or "").strip().upper()
-    if not value:
-        return ""
-    return COUNTRY_NORMALISATION.get(value, value)
+    value = country.strip().upper() if country else ""
+    return COUNTRY_NORMALISATION.get(value, value) if value else ""
 
+
+# ── HTTP session ──────────────────────────────────────────────────────────────
 
 @st.cache_resource
 def get_http_session() -> requests.Session:
@@ -116,31 +119,37 @@ def get_http_session() -> requests.Session:
         allowed_methods=["GET"],
         raise_on_status=False,
     )
-    adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=20, pool_maxsize=20)
+    # Pool size matches MAX_WORKERS so no connection is ever queued waiting
+    adapter = HTTPAdapter(
+        max_retries=retry_strategy,
+        pool_connections=MAX_WORKERS,
+        pool_maxsize=MAX_WORKERS + 4,
+    )
     session = requests.Session()
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     return session
 
 
+# ── SQLite ────────────────────────────────────────────────────────────────────
+
 @st.cache_resource
 def get_db_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    # WAL mode + aggressive memory use — reads never block writes
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA temp_store=MEMORY;")
-    conn.execute(
-        """
+    conn.execute("PRAGMA cache_size=-32768;")   # 32 MB page cache (was default 2 MB)
+    conn.execute("PRAGMA mmap_size=268435456;") # 256 MB memory-mapped I/O
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS director_country_cache (
             company_number TEXT PRIMARY KEY,
             excluded INTEGER NOT NULL,
             director_countries TEXT,
             checked_at TEXT NOT NULL
-        )
-        """
-    )
-    conn.execute(
-        """
+        )""")
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS daily_company_snapshots (
             run_date TEXT NOT NULL,
             company_number TEXT NOT NULL,
@@ -149,59 +158,48 @@ def get_db_connection() -> sqlite3.Connection:
             time_added_to_table TEXT NOT NULL,
             pull_order INTEGER NOT NULL,
             PRIMARY KEY (run_date, company_number)
-        )
-        """
-    )
-    conn.execute(
-        """
+        )""")
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS daily_seen_companies (
             run_date TEXT NOT NULL,
             company_number TEXT NOT NULL,
             PRIMARY KEY (run_date, company_number)
-        )
-        """
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_snapshot_run_date ON daily_company_snapshots(run_date)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_seen_run_date ON daily_seen_companies(run_date)"
-    )
+        )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_snapshot_run_date ON daily_company_snapshots(run_date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_seen_run_date ON daily_seen_companies(run_date)")
     conn.commit()
     return conn
 
 
+# ── Rate limiter (deque-based, O(1)) ─────────────────────────────────────────
+
 def throttle_for_key(api_key: str) -> None:
+    """Sliding-window rate limiter using collections.deque for O(1) operations."""
     while True:
-        now_ts = time.time()
-        with request_budget_lock:
-            timestamps = request_budget.setdefault(api_key, [])
+        now_ts = time.monotonic()  # monotonic avoids DST/NTP jumps
+        with _rate_lock:
+            bucket = _rate_buckets.setdefault(api_key, deque())
             cutoff = now_ts - RATE_WINDOW_SECONDS
-            while timestamps and timestamps[0] < cutoff:
-                timestamps.pop(0)
-            if len(timestamps) < SAFE_REQUESTS_PER_WINDOW:
-                timestamps.append(now_ts)
+            while bucket and bucket[0] < cutoff:
+                bucket.popleft()          # O(1) vs list.pop(0) which is O(n)
+            if len(bucket) < SAFE_REQUESTS_PER_WINDOW:
+                bucket.append(now_ts)
                 return
-            sleep_for = max(0.25, RATE_WINDOW_SECONDS - (now_ts - timestamps[0]))
+            sleep_for = max(0.25, RATE_WINDOW_SECONDS - (now_ts - bucket[0]))
         time.sleep(min(sleep_for, 2.0))
 
 
 def fetch_with_rotation(
     session: requests.Session,
     url: str,
-    params: Optional[Dict[str, str]],
+    params: Optional[Dict],
     api_keys: List[str],
     timeout: int = REQUEST_TIMEOUT,
 ) -> requests.Response:
     last_response = None
     for api_key in api_keys:
         throttle_for_key(api_key)
-        response = session.get(
-            url,
-            headers=auth_header(api_key),
-            params=params,
-            timeout=timeout,
-        )
+        response = session.get(url, headers=_get_auth_header(api_key), params=params, timeout=timeout)
         if response.status_code in (401, 429):
             last_response = response
             continue
@@ -212,25 +210,28 @@ def fetch_with_rotation(
     raise RuntimeError("No valid Companies House API keys were available.")
 
 
+# ── DB helpers ────────────────────────────────────────────────────────────────
+
+_write_lock = threading.Lock()
+
+
 def get_cached_decisions_map(company_numbers: List[str]) -> Dict[str, bool]:
     if not company_numbers:
         return {}
     conn = get_db_connection()
-    placeholders = ",".join("?" for _ in company_numbers)
-    query = f"""
-        SELECT company_number, excluded
-        FROM director_country_cache
-        WHERE company_number IN ({placeholders})
-    """
-    rows = conn.execute(query, company_numbers).fetchall()
-    return {str(company_number): bool(excluded) for company_number, excluded in rows}
+    placeholders = ",".join("?" * len(company_numbers))
+    rows = conn.execute(
+        f"SELECT company_number, excluded FROM director_country_cache WHERE company_number IN ({placeholders})",
+        company_numbers,
+    ).fetchall()
+    return {cn: bool(ex) for cn, ex in rows}
 
 
 def upsert_director_decision(company_number: str, excluded: bool, countries: List[str]) -> None:
     conn = get_db_connection()
-    checked_at = now_uk_str()
     countries_str = ", ".join(sorted(set(countries)))
-    with write_lock:
+    checked_at = now_uk_str()
+    with _write_lock:
         conn.execute(
             """
             INSERT INTO director_country_cache (company_number, excluded, director_countries, checked_at)
@@ -241,6 +242,34 @@ def upsert_director_decision(company_number: str, excluded: bool, countries: Lis
                 checked_at = excluded.checked_at
             """,
             (company_number, int(excluded), countries_str, checked_at),
+        )
+        conn.commit()
+
+
+# ── Batch DB write: single transaction for all uncached results ───────────────
+
+def batch_upsert_decisions(results: List[Tuple[str, bool, List[str]]]) -> None:
+    """Write all officer-check results in ONE transaction — drastically faster than
+    one commit per company when handling dozens of new companies."""
+    if not results:
+        return
+    conn = get_db_connection()
+    checked_at = now_uk_str()
+    rows = [
+        (cn, int(ex), ", ".join(sorted(set(countries))), checked_at)
+        for cn, ex, countries in results
+    ]
+    with _write_lock:
+        conn.executemany(
+            """
+            INSERT INTO director_country_cache (company_number, excluded, director_countries, checked_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(company_number) DO UPDATE SET
+                excluded = excluded,
+                director_countries = excluded.director_countries,
+                checked_at = excluded.checked_at
+            """,
+            rows,
         )
         conn.commit()
 
@@ -257,36 +286,34 @@ def get_active_director_countries(
         "items_per_page": "100",
     }
     response = fetch_with_rotation(session, url, params, api_keys)
-    payload = response.json()
-    items = payload.get("items", []) or []
-    countries: List[str] = []
-    for officer in items:
-        country = normalise_country(officer.get("country_of_residence", ""))
-        if country:
-            countries.append(country)
-    return countries
+    items = response.json().get("items") or []
+    return [
+        c for officer in items
+        if (c := normalise_country(officer.get("country_of_residence", "")))
+    ]
 
 
 def check_company_exclusion(
     company_number: str,
     api_keys: List[str],
 ) -> Tuple[str, bool, List[str]]:
+    """Returns (company_number, excluded, countries) — does NOT write to DB.
+    Batch writing is handled by the caller for efficiency."""
     session = get_http_session()
     try:
         countries = get_active_director_countries(session, company_number, api_keys)
-        excluded = any(country in EXCLUDED_DIRECTOR_COUNTRIES for country in countries)
+        excluded = any(c in EXCLUDED_DIRECTOR_COUNTRIES for c in countries)
     except requests.RequestException:
         countries = []
         excluded = False
-    upsert_director_decision(company_number, excluded, countries)
     return company_number, excluded, countries
 
 
 def fetch_candidate_companies(api_keys: List[str], run_date: str) -> pd.DataFrame:
     session = get_http_session()
     url = "https://api.company-information.service.gov.uk/advanced-search/companies"
+    rows: List[dict] = []
     start_index = 0
-    rows = []
 
     while True:
         params = {
@@ -298,36 +325,35 @@ def fetch_candidate_companies(api_keys: List[str], run_date: str) -> pd.DataFram
         }
         response = fetch_with_rotation(session, url, params, api_keys)
         payload = response.json()
-        items = payload.get("items", []) or []
+        items = payload.get("items") or []
 
         for item in items:
-            company_number = str(item.get("company_number", "")).strip()
+            company_number = item.get("company_number", "").strip()
             if not company_number:
                 continue
-            sic_codes = [str(code) for code in item.get("sic_codes", []) if code]
+            sic_codes = [str(c) for c in (item.get("sic_codes") or []) if c]
             sector = classify_sector(sic_codes)
-            if not sector:
-                continue
-            rows.append(
-                {
+            if sector:
+                rows.append({
                     "company_number": company_number,
                     "company_name": item.get("company_name", ""),
                     "sector": sector,
-                }
-            )
+                })
 
         if len(items) < ADVANCED_SEARCH_PAGE_SIZE:
             break
         start_index += ADVANCED_SEARCH_PAGE_SIZE
 
-    df = pd.DataFrame(rows)
-    if df.empty:
+    if not rows:
         return pd.DataFrame(columns=["company_number", "company_name", "sector"])
-    df = df.drop_duplicates(subset=["company_number"], keep="first").reset_index(drop=True)
-    return df
+    df = pd.DataFrame(rows)
+    return df.drop_duplicates(subset=["company_number"], keep="first").reset_index(drop=True)
 
 
-def enrich_exclusions(candidate_df: pd.DataFrame, api_keys: List[str]) -> Tuple[pd.DataFrame, int, int]:
+def enrich_exclusions(
+    candidate_df: pd.DataFrame,
+    api_keys: List[str],
+) -> Tuple[pd.DataFrame, int, int]:
     if candidate_df.empty:
         return candidate_df.copy(), 0, 0
 
@@ -337,26 +363,35 @@ def enrich_exclusions(candidate_df: pd.DataFrame, api_keys: List[str]) -> Tuple[
     uncached_numbers = [n for n in company_numbers if n not in cached_map]
 
     if uncached_numbers:
-        with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(uncached_numbers))) as executor:
-            futures = {executor.submit(check_company_exclusion, company_number, api_keys): company_number for company_number in uncached_numbers}
+        workers = min(MAX_WORKERS, len(uncached_numbers))
+        fresh_results: List[Tuple[str, bool, List[str]]] = []
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(check_company_exclusion, cn, api_keys): cn
+                for cn in uncached_numbers
+            }
             for future in as_completed(futures):
-                company_number, excluded, _ = future.result()
-                cached_map[company_number] = excluded
+                result = future.result()
+                fresh_results.append(result)
+                cached_map[result[0]] = result[1]
+
+        # Single transaction for all new results — replaces N individual commits
+        batch_upsert_decisions(fresh_results)
 
     checked_via_api = len(uncached_numbers)
-    filtered_df = candidate_df[~candidate_df["company_number"].astype(str).map(cached_map).fillna(False)].copy()
-    return filtered_df.reset_index(drop=True), checked_via_api, cache_hits
+    mask = candidate_df["company_number"].astype(str).map(cached_map).fillna(False)
+    return candidate_df[~mask].reset_index(drop=True), checked_via_api, cache_hits
 
 
 def load_snapshot(run_date: str) -> pd.DataFrame:
     conn = get_db_connection()
-    query = """
-        SELECT company_number, company_name, sector, time_added_to_table, pull_order
-        FROM daily_company_snapshots
-        WHERE run_date = ?
-        ORDER BY pull_order DESC
-    """
-    df = pd.read_sql_query(query, conn, params=(run_date,))
+    df = pd.read_sql_query(
+        "SELECT company_number, company_name, sector, time_added_to_table, pull_order "
+        "FROM daily_company_snapshots WHERE run_date = ? ORDER BY pull_order DESC",
+        conn,
+        params=(run_date,),
+    )
     if df.empty:
         return pd.DataFrame(columns=["company_number", "company_name", "sector", "time_added_to_table", "pull_order"])
     df["time_added_to_table"] = pd.to_datetime(df["time_added_to_table"], errors="coerce")
@@ -366,8 +401,11 @@ def load_snapshot(run_date: str) -> pd.DataFrame:
 
 def load_seen(run_date: str) -> pd.DataFrame:
     conn = get_db_connection()
-    query = "SELECT company_number FROM daily_seen_companies WHERE run_date = ?"
-    return pd.read_sql_query(query, conn, params=(run_date,))
+    return pd.read_sql_query(
+        "SELECT company_number FROM daily_seen_companies WHERE run_date = ?",
+        conn,
+        params=(run_date,),
+    )
 
 
 def identify_new_rows(current_df: pd.DataFrame, seen_df: pd.DataFrame) -> pd.DataFrame:
@@ -375,8 +413,8 @@ def identify_new_rows(current_df: pd.DataFrame, seen_df: pd.DataFrame) -> pd.Dat
         return current_df.copy()
     if seen_df.empty or "company_number" not in seen_df.columns:
         return current_df.copy()
-    unseen = current_df[~current_df["company_number"].isin(seen_df["company_number"].astype(str))].copy()
-    return unseen.reset_index(drop=True)
+    seen_set = set(seen_df["company_number"].astype(str))   # O(1) lookup set
+    return current_df[~current_df["company_number"].isin(seen_set)].reset_index(drop=True)
 
 
 def save_daily_state(run_date: str, current_df: pd.DataFrame) -> None:
@@ -384,21 +422,22 @@ def save_daily_state(run_date: str, current_df: pd.DataFrame) -> None:
     export_df = current_df.copy()
     export_df["run_date"] = run_date
     export_df["time_added_to_table"] = export_df["time_added_to_table"].astype(str)
-    with write_lock:
+    with _write_lock:
+        # Combine both DELETEs + both INSERTs into one transaction
+        conn.execute("BEGIN")
         conn.execute("DELETE FROM daily_company_snapshots WHERE run_date = ?", (run_date,))
         conn.execute("DELETE FROM daily_seen_companies WHERE run_date = ?", (run_date,))
-        export_df[["run_date", "company_number", "company_name", "sector", "time_added_to_table", "pull_order"]].to_sql(
-            "daily_company_snapshots", conn, if_exists="append", index=False
-        )
+        export_df[
+            ["run_date", "company_number", "company_name", "sector", "time_added_to_table", "pull_order"]
+        ].to_sql("daily_company_snapshots", conn, if_exists="append", index=False)
         export_df[["run_date", "company_number"]].drop_duplicates().to_sql(
             "daily_seen_companies", conn, if_exists="append", index=False
         )
-        conn.commit()
+        conn.execute("COMMIT")
 
 
 def get_cache_size() -> int:
-    conn = get_db_connection()
-    row = conn.execute("SELECT COUNT(*) FROM director_country_cache").fetchone()
+    row = get_db_connection().execute("SELECT COUNT(*) FROM director_country_cache").fetchone()
     return int(row[0]) if row else 0
 
 
@@ -408,14 +447,13 @@ def render_table(df: pd.DataFrame, title: str) -> None:
         st.info("No companies to show yet.")
         return
     display_df = (
-        df.sort_values("time_added_to_table", ascending=False, kind="stable")[["company_name", "sector", "time_added_to_table"]]
-        .rename(
-            columns={
-                "company_name": "Company Name",
-                "sector": "Sector",
-                "time_added_to_table": "Time Added To Table",
-            }
-        )
+        df.sort_values("time_added_to_table", ascending=False, kind="stable")
+        [["company_name", "sector", "time_added_to_table"]]
+        .rename(columns={
+            "company_name": "Company Name",
+            "sector": "Sector",
+            "time_added_to_table": "Time Added To Table",
+        })
     )
     st.dataframe(display_df, use_container_width=True, hide_index=True)
 
@@ -423,20 +461,22 @@ def render_table(df: pd.DataFrame, title: str) -> None:
 @st.cache_data
 def convert_df_to_download_csv(df: pd.DataFrame) -> bytes:
     return (
-        df.sort_values("time_added_to_table", ascending=False, kind="stable")[["company_name", "sector", "time_added_to_table"]]
-        .rename(
-            columns={
-                "company_name": "Company Name",
-                "sector": "Sector",
-                "time_added_to_table": "Time Added To Table",
-            }
-        )
+        df.sort_values("time_added_to_table", ascending=False, kind="stable")
+        [["company_name", "sector", "time_added_to_table"]]
+        .rename(columns={
+            "company_name": "Company Name",
+            "sector": "Sector",
+            "time_added_to_table": "Time Added To Table",
+        })
         .to_csv(index=False)
         .encode("utf-8")
     )
 
 
-def build_current_day_dataset(api_keys: List[str], run_date: str) -> Tuple[pd.DataFrame, pd.DataFrame, int, int]:
+def build_current_day_dataset(
+    api_keys: List[str],
+    run_date: str,
+) -> Tuple[pd.DataFrame, pd.DataFrame, int, int]:
     candidate_df = fetch_candidate_companies(api_keys, run_date)
     filtered_df, checked_via_api, cache_hits = enrich_exclusions(candidate_df, api_keys)
 
@@ -446,13 +486,16 @@ def build_current_day_dataset(api_keys: List[str], run_date: str) -> Tuple[pd.Da
         current_df["time_added_to_table"] = now_uk_str()
         current_df["pull_order"] = range(len(current_df))
     else:
-        existing_numbers = set(existing_df["company_number"].astype(str)) if "company_number" in existing_df.columns else set()
+        existing_numbers = set(existing_df["company_number"].astype(str))
         new_rows = filtered_df[~filtered_df["company_number"].astype(str).isin(existing_numbers)].copy()
         if not new_rows.empty:
             new_rows["time_added_to_table"] = now_uk_str()
             new_rows["pull_order"] = range(len(new_rows))
-        current_df = pd.concat([new_rows, existing_df], ignore_index=True)
-        current_df = current_df.drop_duplicates(subset=["company_number"], keep="first").reset_index(drop=True)
+        current_df = (
+            pd.concat([new_rows, existing_df], ignore_index=True)
+            .drop_duplicates(subset=["company_number"], keep="first")
+            .reset_index(drop=True)
+        )
 
     seen_df = load_seen(run_date)
     new_df = identify_new_rows(current_df, seen_df)
@@ -463,13 +506,13 @@ def build_current_day_dataset(api_keys: List[str], run_date: str) -> Tuple[pd.Da
 def main() -> None:
     st.title("Companies Incorporated Today")
     st.caption(
-        "Shows companies incorporated today that match your Tech and Holdings SIC code lists, "
-        "excluding companies with active directors whose country of residence is Pakistan, Turkey, China, or Nigeria."
+        "Shows companies incorporated today matching Tech and Holdings SIC codes, "
+        "excluding companies with active directors resident in Pakistan, Turkey, China, or Nigeria."
     )
 
     api_keys = get_api_keys()
     if not api_keys:
-        st.error("Add COMPANIES_HOUSE_API_KEYS or CH_API_KEY_1/2/3 to your Streamlit secrets before running the app.")
+        st.error("Add COMPANIES_HOUSE_API_KEYS or CH_API_KEY_1/2/3 to your Streamlit secrets.")
         st.stop()
 
     run_date = today_uk_str()
@@ -484,20 +527,20 @@ def main() -> None:
         current_df, new_df, checked_via_api, cache_hits = build_current_day_dataset(api_keys, run_date)
         elapsed = time.perf_counter() - started
 
-        st.session_state["latest_df"] = current_df
-        st.session_state["new_df"] = new_df
-        st.session_state["checked_this_run"] = checked_via_api
-        st.session_state["cache_hits_this_run"] = cache_hits
-        st.session_state["cache_size"] = get_cache_size()
-        st.session_state["elapsed_seconds"] = round(elapsed, 2)
-        st.session_state["last_refresh"] = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        st.session_state.update({
+            "latest_df": current_df,
+            "new_df": new_df,
+            "checked_this_run": checked_via_api,
+            "cache_hits_this_run": cache_hits,
+            "cache_size": get_cache_size(),
+            "elapsed_seconds": round(elapsed, 2),
+            "last_refresh": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"),
+        })
     else:
         current_df = load_snapshot(run_date)
         st.session_state.setdefault("latest_df", current_df)
-        st.session_state.setdefault(
-            "new_df",
-            pd.DataFrame(columns=current_df.columns if not current_df.empty else ["company_number", "company_name", "sector", "time_added_to_table", "pull_order"]),
-        )
+        empty_cols = current_df.columns if not current_df.empty else ["company_number", "company_name", "sector", "time_added_to_table", "pull_order"]
+        st.session_state.setdefault("new_df", pd.DataFrame(columns=empty_cols))
         st.session_state.setdefault("checked_this_run", 0)
         st.session_state.setdefault("cache_hits_this_run", 0)
         st.session_state.setdefault("cache_size", get_cache_size())
@@ -521,39 +564,32 @@ def main() -> None:
     render_table(current_df, "All companies pulled so far today")
 
     if not current_df.empty:
-        csv_bytes = convert_df_to_download_csv(current_df)
         st.download_button(
-            label="Download today’s results as CSV",
-            data=csv_bytes,
+            label="Download today's results as CSV",
+            data=convert_df_to_download_csv(current_df),
             file_name=f"companies_incorporated_{run_date}.csv",
             mime="text/csv",
             key="download_csv_button",
         )
 
     with st.expander("Suggested .streamlit/secrets.toml"):
-        secrets_example = """COMPANIES_HOUSE_API_KEYS = [
-  \"your-first-key\",
-  \"your-second-key\",
-  \"your-third-key\"
-]
-
-# Optional legacy format
-# CH_API_KEY_1 = \"your-first-key\"
-# CH_API_KEY_2 = \"your-second-key\"
-# CH_API_KEY_3 = \"your-third-key\"
-"""
-        st.code(secrets_example, language="toml")
+        st.code(
+            'COMPANIES_HOUSE_API_KEYS = [\n  "your-first-key",\n  "your-second-key",\n  "your-third-key"\n]',
+            language="toml",
+        )
 
     with st.expander("Architecture notes"):
-        st.markdown(
-            """
-- Uses persistent SQLite caching across all days for company exclusion decisions.
-- Reuses a pooled HTTP session with retries and backoff.
-- Runs uncached officer lookups concurrently with a bounded worker pool.
-- Applies rate-aware throttling to stay below Companies House API limits.
-- Separates candidate fetch, exclusion enrichment, persistent state, and UI rendering.
-            """
-        )
+        st.markdown("""
+- Persistent SQLite caching with 32 MB page cache and 256 MB mmap for near-zero read latency.
+- All officer-check results batched into a **single SQLite transaction** per refresh.
+- Auth headers pre-computed and cached — Base64 encoding runs once per key, ever.
+- `deque`-based sliding-window rate limiter: O(1) vs the original O(n) `list.pop(0)`.
+- `time.monotonic()` for rate-limiting timestamps — immune to clock changes.
+- `frozenset` for SIC code lookups — slightly faster membership than `set`.
+- Thread pool sized to `MAX_WORKERS` with matching HTTP connection pool — no queueing.
+- `save_daily_state` wraps all four DB operations in one explicit transaction.
+- `session_state.update({})` batches state writes in a single call.
+        """)
 
 
 if __name__ == "__main__":
